@@ -91,7 +91,7 @@ Important behavior:
 ### Import the workflow
 
 1. Open your n8n editor at `http://localhost:5678`
-2. Import [`automation/workflow.json`](./automation/workflow.json)
+2. Import [`../03-automation/automation/workflow.json`](../03-automation/automation/workflow.json)
 3. No Google Sheets credential is needed
 4. Activate the workflow
 5. Copy the production or test webhook URL
@@ -183,10 +183,12 @@ The workflow returns:
 
 ### Reliability Notes
 
-- Retries: if the n8n webhook fails, Graspia keeps the handover event and simply skips the acknowledgement for that turn
+- Retries: the n8n workflow retries OpenAI validation/classification/acknowledgement calls twice, retries lead database save three times, and retries Telegram notification three times. Retry waits start at 2000ms
+- Webhook failures: if the n8n webhook fails, Graspia keeps the handover event and simply skips the acknowledgement for that turn
 - Failures: database writes are best effort, so storage problems do not block AI classification, hot-lead notification, or the final acknowledgement
 - Duplicates: the `graspia_leads` table deduplicates by normalized email first, then phone, and falls back to `conversation_id`
 - AI fallback: if the workflow cannot call OpenAI, it falls back to deterministic validation and lead-tier heuristics
+- Production reliability: add a durable dead-letter queue and monitoring view for failures that remain after retry limits
 
 ## API Contract
 
@@ -345,5 +347,5 @@ The workflow does not require Google Sheets or OAuth; it stores leads in Supabas
 - [`app/api/automation/notify/route.ts`](./app/api/automation/notify/route.ts) - optional local notification test endpoint from the earlier mock setup
 - [`lib/agent.ts`](./lib/agent.ts) - prompting, heuristics, and structured decision logic
 - [`app/chat-shell.tsx`](./app/chat-shell.tsx) - test UI
-- [`automation/workflow.json`](./automation/workflow.json) - importable n8n workflow
+- [`../03-automation/automation/workflow.json`](../03-automation/automation/workflow.json) - importable n8n workflow
 - [`supabase/graspia_conversations.sql`](./supabase/graspia_conversations.sql) - conversation and lead storage schema

@@ -86,7 +86,16 @@ Important: `.env.n8n` must contain local secrets only and should not be committe
 - Duplicates: the app endpoint deduplicates by normalized email first, then phone, then conversation id.
 - Notification failures: Telegram notification uses `continueOnFail`, and the returned payload marks `notificationChannel` as `telegram-failed` if the send fails.
 - Human handover: hot leads and close moments should alert a human immediately; warm and cold leads are saved without urgent interruption.
-- Reliability upgrades for production: add a durable queue, retry policy with dead-letter handling, webhook idempotency keys, rate limits, and an operations dashboard for failed saves/notifications.
+
+## Reliability Plan
+
+The current demo includes bounded retries for the fragile external calls, but it does not include a durable dead-letter queue yet.
+
+- Retries: OpenAI validation/classification/acknowledgement calls retry twice, lead database save retries three times, and the Telegram HTTP node retries three times. Retry waits start at 2000ms.
+- Failures: after retries are exhausted, the workflow catches database save errors, falls back to local AI heuristics, and uses `continueOnFail` for Telegram so the customer still receives an acknowledgement.
+- Duplicate leads: `/api/automation/lead` upserts by `dedupe_key`, using normalized email first, phone second, and `conversation_id` as the fallback.
+- Idempotency: production webhooks should include a stable event id so a retried webhook updates the same lead instead of creating another record.
+- Operations: for production, failed saves, failed notifications, and rejected leads should appear in a simple monitoring dashboard or alert channel. Failed jobs should move to a dead-letter view after the retry limit.
 
 ## How To Run
 
@@ -95,4 +104,31 @@ Important: `.env.n8n` must contain local secrets only and should not be committe
 3. Import `../03-automation/automation/workflow.json`.
 4. Set the n8n environment variables from `.env.n8n`.
 5. Activate the workflow and use its webhook URL as `NOTIFY_WEBHOOK_URL` in the Graspia app.
+
+### Run n8n with Docker on Windows PowerShell
+
+Create the Docker-managed volume once:
+
+```powershell
+docker volume create n8n_data
+```
+
+Run n8n with the local timezone, tunnel enabled, and the project env file:
+
+```powershell
+docker run -it --rm `
+  --name n8n `
+  -p 5678:5678 `
+  --env-file D:\interview-whattheproperty\project_list\03-automation\.env.n8n `
+  -e GENERIC_TIMEZONE="Asia/Bangkok" `
+  -e TZ="Asia/Bangkok" `
+  -e N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true `
+  -e N8N_RUNNERS_ENABLED=true `
+  -e N8N_TUNNEL=true `
+  -v n8n_data:/home/node/.n8n `
+  docker.n8n.io/n8nio/n8n
+```
+
+The tunnel URL is useful for testing webhooks from external services. For local Graspia-to-n8n testing, `http://localhost:5678` is enough.
+
 

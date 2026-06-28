@@ -1,213 +1,216 @@
 {
-    "name": "Graspia Handover Automation",
-    "nodes": [
-        {
-            "parameters": {
-                "httpMethod": "POST",
-                "path": "graspia-handover",
-                "responseMode": "lastNode",
-                "responseData": "firstEntryJson",
-                "options": {}
-            },
-            "id": "0f0f4d46-4bb5-47d4-ab5b-4243a309c6dd",
-            "name": "Receive Lead Webhook",
-            "type": "n8n-nodes-base.webhook",
-            "typeVersion": 2,
-            "position": [
-                160,
-                260
-            ],
-            "webhookId": "graspia-handover"
-        },
-        {
-            "parameters": {
-                "jsCode": "const payload = $json.body ?? $json;\nconst normalize = (value) =\u003e String(value ?? \u0027\u0027).trim();\nconst digitsOnly = (value) =\u003e normalize(value).replace(/\\D/g, \u0027\u0027);\nconst allUserText = (payload.messages ?? [])\n  .filter((message) =\u003e message.role === \u0027user\u0027)\n  .map((message) =\u003e String(message.content ?? \u0027\u0027))\n  .join(\u0027 \u0027);\nconst latestUserMessage = [...(payload.messages ?? [])].reverse().find((message) =\u003e message.role === \u0027user\u0027)?.content ?? \u0027\u0027;\nconst extractedPhone = allUserText.match(/(?:\\+\\d{7,15}|(?:\\+?66|0)\\d[\\d\\s-]{7,})/)?.[0] ?? \u0027\u0027;\nconst extractedEmail = allUserText.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/i)?.[0] ?? \u0027\u0027;\nconst extractedName = allUserText.match(/(?:my name is|name is|i am|i\u0027m)\\s+([A-Za-z][A-Za-z\\s\u0027-]{1,40})/i)?.[1]?.trim() ?? \u0027\u0027;\nconst preferredContact = normalize(payload.lead?.preferredContact) || (extractedPhone ? \u0027phone\u0027 : extractedEmail ? \u0027email\u0027 : \u0027\u0027);\nconst notes = normalize(payload.lead?.notes);\nconst lead = {\n  name: normalize(payload.name ?? payload.lead?.name) || extractedName,\n  phone: normalize(payload.phone ?? payload.lead?.phone) || normalize(extractedPhone),\n  email: normalize(payload.email ?? payload.lead?.email) || normalize(extractedEmail),\n  message: normalize(payload.message || latestUserMessage || payload.handover?.summary),\n  budget: normalize(payload.budget),\n  area: normalize(payload.area),\n  preferredContact,\n  notes,\n};\nconst fallbackFlags = [];\nif (!lead.phone \u0026\u0026 !lead.email) fallbackFlags.push(\u0027missing_contact\u0027);\nif (lead.message.length \u003c 8) fallbackFlags.push(\u0027message_too_short\u0027);\nif (/^(test|tester|admin|fake|unknown|n\\/a)$/i.test(lead.name)) fallbackFlags.push(\u0027fake_name\u0027);\nif (/^(test|fake|demo|sample)/i.test(lead.email)) fallbackFlags.push(\u0027fake_email\u0027);\nif (digitsOnly(lead.phone) \u0026\u0026 /^(0|1|9)\\1+$/.test(digitsOnly(lead.phone))) fallbackFlags.push(\u0027fake_phone\u0027);\nif (/free money|casino|crypto|seo service|loan|https?:\\/\\//i.test(Object.values(lead).join(\u0027 \u0027))) fallbackFlags.push(\u0027spam_pattern\u0027);\nlet validation = {\n  valid: fallbackFlags.length === 0,\n  reason: fallbackFlags[0] ?? null,\n  flags: fallbackFlags\n};\nif ($env.OPENAI_API_KEY) {\n  try {\n    const response = await fetch(\u0027https://api.openai.com/v1/chat/completions\u0027, {\n      method: \u0027POST\u0027,\n      headers: {\n        \u0027Content-Type\u0027: \u0027application/json\u0027,\n        Authorization: `Bearer ${$env.OPENAI_API_KEY}`\n      },\n      body: JSON.stringify({\n        model: \u0027gpt-5.4-mini\u0027,\n        temperature: 0,\n        response_format: { type: \u0027json_object\u0027 },\n        messages: [\n          {\n            role: \u0027system\u0027,\n            content: \u0027You validate inbound sales leads. Return strict JSON only: {\"valid\":boolean,\"reason\":string|null,\"flags\":[string]}. Reject spam, empty leads, fake-looking names/contact details, nonsense, or entries without any usable contact method. Do not reject just because optional budget or area is missing.\u0027\n          },\n          {\n            role: \u0027user\u0027,\n            content: JSON.stringify({ lead, handover: payload.handover ?? null })\n          }\n        ]\n      })\n    });\n    if (response.ok) {\n      const data = await response.json();\n      const parsed = JSON.parse(data.choices?.[0]?.message?.content ?? \u0027{}\u0027);\n      if (typeof parsed.valid === \u0027boolean\u0027) {\n        validation = {\n          valid: parsed.valid,\n          reason: parsed.reason ?? (parsed.valid ? null : \u0027ai_rejected\u0027),\n          flags: Array.isArray(parsed.flags) ? parsed.flags.map(String) : fallbackFlags\n        };\n      }\n    }\n  } catch (error) {\n    validation.flags = [...new Set([...validation.flags, \u0027ai_validation_fallback\u0027])];\n  }\n}\nreturn [{ json: { ...payload, ...lead, validation } }];"
-            },
-            "id": "64cedc73-2c2e-49fe-8f07-63f605cf925d",
-            "name": "AI Validate Lead",
-            "type": "n8n-nodes-base.code",
-            "typeVersion": 2,
-            "position": [
-                400,
-                260
-            ]
-        },
-        {
-            "parameters": {
-                "jsCode": "const baseUrl = $env.GRASPIA_APP_BASE_URL || \u0027http://host.docker.internal:3000\u0027;\nconst storage = { databaseSaved: false, databaseError: null };\nconst preliminaryAutomation = {\n  accepted: Boolean($json.validation?.valid),\n  rejected: !Boolean($json.validation?.valid),\n  tier: \u0027cold\u0027,\n  reasoning: $json.validation?.valid ? \u0027Lead received and stored before classification.\u0027 : `Lead rejected during validation: ${$json.validation?.reason ?? \u0027unknown\u0027}`,\n  autoReply: \u0027\u0027,\n  notifyUrgent: false,\n  notificationSent: false,\n  notificationChannel: \u0027not-classified-yet\u0027,\n  validationReason: $json.validation?.reason ?? null\n};\ntry {\n  const response = await fetch(`${baseUrl}/api/automation/lead`, {\n    method: \u0027POST\u0027,\n    headers: { \u0027Content-Type\u0027: \u0027application/json\u0027 },\n    body: JSON.stringify({\n      conversationId: $json.conversationId,\n      preferredLanguage: $json.preferredLanguage ?? \u0027en\u0027,\n      name: $json.name ?? \u0027\u0027,\n      phone: $json.phone ?? \u0027\u0027,\n      email: $json.email ?? \u0027\u0027,\n      message: $json.message ?? \u0027\u0027,\n      budget: $json.budget ?? \u0027\u0027,\n      area: $json.area ?? \u0027\u0027,\n      handover: $json.handover ?? null,\n      automation: preliminaryAutomation,\n      rawPayload: $json\n    })\n  });\n  if (response.ok) {\n    const saved = await response.json();\n    storage.databaseSaved = true;\n    storage.leadRecordId = saved.leadRecordId ?? null;\n  } else {\n    storage.databaseError = `${response.status} ${await response.text()}`;\n  }\n} catch (error) {\n  storage.databaseError = error instanceof Error ? error.message : String(error);\n}\nreturn [{ json: { ...$json, storage } }];"
-            },
-            "id": "05ed144b-5f47-4139-ae6d-d2a3a8cc109e",
-            "name": "Save Lead to Database Best Effort",
-            "type": "n8n-nodes-base.code",
-            "typeVersion": 2,
-            "position": [
-                640,
-                260
-            ]
-        },
-        {
-            "parameters": {
-                "jsCode": "const payload = $(\u0027AI Validate Lead\u0027).first().json;\nconst storage = $(\u0027Save Lead to Database Best Effort\u0027).first().json.storage ?? {};\nconst preferredLanguage = payload.preferredLanguage === \u0027th\u0027 ? \u0027th\u0027 : \u0027en\u0027;\nconst invalid = !payload.validation?.valid;\nlet classification = invalid\n  ? {\n      tier: \u0027cold\u0027,\n      reasoning: `Lead rejected during validation: ${payload.validation?.reason ?? \u0027invalid\u0027}`,\n      autoReply: \u0027\u0027\n    }\n  : null;\nif (!classification \u0026\u0026 $env.OPENAI_API_KEY) {\n  try {\n    const response = await fetch(\u0027https://api.openai.com/v1/chat/completions\u0027, {\n      method: \u0027POST\u0027,\n      headers: {\n        \u0027Content-Type\u0027: \u0027application/json\u0027,\n        Authorization: `Bearer ${$env.OPENAI_API_KEY}`\n      },\n      body: JSON.stringify({\n        model: \u0027gpt-5.4-mini\u0027,\n        temperature: 0.2,\n        response_format: { type: \u0027json_object\u0027 },\n        messages: [\n          {\n            role: \u0027system\u0027,\n            content: \u0027You classify validated inbound solar leads. Return strict JSON only: {\"tier\":\"hot|warm|cold\",\"reasoning\":\"...\"}. Base tier on message, budget, area, buying urgency, frustration, and handover reason. hot means immediate team notification is needed. warm/cold should not trigger urgent notification.\u0027\n          },\n          {\n            role: \u0027user\u0027,\n            content: JSON.stringify({\n              preferredLanguage,\n              lead: {\n                name: payload.name,\n                phone: payload.phone,\n                email: payload.email,\n                message: payload.message,\n                budget: payload.budget,\n                area: payload.area\n              },\n              handover: payload.handover ?? null\n            })\n          }\n        ]\n      })\n    });\n    if (response.ok) {\n      const data = await response.json();\n      const parsed = JSON.parse(data.choices?.[0]?.message?.content ?? \u0027{}\u0027);\n      if ([\u0027hot\u0027, \u0027warm\u0027, \u0027cold\u0027].includes(parsed.tier) \u0026\u0026 typeof parsed.reasoning === \u0027string\u0027) {\n        classification = {\n          tier: parsed.tier,\n          reasoning: parsed.reasoning,\n          autoReply: \u0027\u0027\n        };\n      }\n    }\n  } catch (error) {\n    // Fallback below keeps the workflow moving.\n  }\n}\nif (!classification) {\n  const text = `${payload.message} ${payload.budget} ${payload.handover?.summary ?? \u0027\u0027}`.toLowerCase();\n  const isHot = payload.handover?.reason === \u0027ready_to_buy\u0027 || payload.handover?.reason === \u0027angry_client\u0027 || /ready|buy|purchase|sign|pay|deposit|invoice/.test(text);\n  const isWarm = payload.handover?.reason === \u0027asked_for_human\u0027 || /\\d/.test(payload.budget ?? \u0027\u0027) || /survey|quote|interested/.test(text);\n  classification = {\n    tier: isHot ? \u0027hot\u0027 : isWarm ? \u0027warm\u0027 : \u0027cold\u0027,\n    reasoning: isHot\n      ? \u0027Fallback scoring marked this lead as urgent based on close intent or frustration.\u0027\n      : isWarm\n        ? \u0027Fallback scoring found interest or budget signal, but no immediate close intent.\u0027\n        : \u0027Fallback scoring found limited buying signal and more qualification is needed.\u0027,\n    autoReply: \u0027\u0027\n  };\n}\nlet autoReply = classification.autoReply;\nif ($env.OPENAI_API_KEY) {\n  try {\n    const replyResponse = await fetch(\u0027https://api.openai.com/v1/chat/completions\u0027, {\n      method: \u0027POST\u0027,\n      headers: {\n        \u0027Content-Type\u0027: \u0027application/json\u0027,\n        Authorization: `Bearer ${$env.OPENAI_API_KEY}`\n      },\n      body: JSON.stringify({\n        model: \u0027gpt-5.4-mini\u0027,\n        temperature: 0.4,\n        response_format: { type: \u0027json_object\u0027 },\n        messages: [\n          {\n            role: \u0027system\u0027,\n            content: \u0027You write a short customer-facing acknowledgement for a solar lead. Return strict JSON only: {\"autoReply\":\"...\"}. Keep it warm, natural, and specific to the conversation. If the lead is incomplete, say the details are not enough yet but the team will reach out soon to ask for the missing information. If the lead is valid, acknowledge interest and mention next steps. Do not mention internal validation errors. Match the preferred language. Avoid sounding robotic or canned.\u0027\n          },\n          {\n            role: \u0027user\u0027,\n            content: JSON.stringify({\n              preferredLanguage,\n              validation: payload.validation ?? null,\n              classification: {\n                tier: classification.tier,\n                reasoning: classification.reasoning\n              },\n              lead: {\n                name: payload.name,\n                phone: payload.phone,\n                email: payload.email,\n                message: payload.message,\n                budget: payload.budget,\n                area: payload.area\n              },\n              handover: payload.handover ?? null,\n              business: payload.business ?? null\n            })\n          }\n        ]\n      })\n    });\n    if (replyResponse.ok) {\n      const replyData = await replyResponse.json();\n      const replyParsed = JSON.parse(replyData.choices?.[0]?.message?.content ?? \u0027{}\u0027);\n      if (typeof replyParsed.autoReply === \u0027string\u0027 \u0026\u0026 replyParsed.autoReply.trim()) {\n        autoReply = replyParsed.autoReply.trim();\n      }\n    }\n  } catch (error) {\n    // Use the fallback auto reply below.\n  }\n}\nif (!autoReply) {\n  autoReply = invalid\n    ? \u0027Thanks for reaching out. We do not have enough details yet, but our team will contact you soon to ask for the missing information and help with the next step.\u0027\n    : \u0027Thanks for the details. Our team will review everything and follow up soon with the next step.\u0027;\n}\nconst automation = {\n  accepted: Boolean(payload.validation?.valid),\n  rejected: !Boolean(payload.validation?.valid),\n  tier: classification.tier,\n  reasoning: classification.reasoning,\n  autoReply,\n  notifyUrgent: classification.tier === \u0027hot\u0027 \u0026\u0026 Boolean(payload.validation?.valid),\n  notificationSent: false,\n  notificationChannel: classification.tier === \u0027hot\u0027 \u0026\u0026 Boolean(payload.validation?.valid) ? \u0027telegram-pending\u0027 : \u0027saved-only\u0027,\n  validationReason: payload.validation?.reason ?? null,\n  leadRecordId: storage.leadRecordId ?? null,\n  storage: {\n    databaseSaved: Boolean(storage.databaseSaved),\n    databaseError: storage.databaseError ?? null\n  }\n};\nreturn [{ json: { ...payload, storage, automation } }];"
-            },
-            "id": "0f59ad1d-3af7-4611-8275-97aab0c08553",
-            "name": "AI Classify Lead",
-            "type": "n8n-nodes-base.code",
-            "typeVersion": 2,
-            "position": [
-                1360,
-                260
-            ]
-        },
-        {
-            "parameters": {
-                "conditions": {
-                    "boolean": [
-                        {
-                            "value1": "={{$json.automation.notifyUrgent}}",
-                            "value2": true
-                        }
-                    ]
-                }
-            },
-            "id": "b6d199c8-625c-4745-a4a7-2d5994543da8",
-            "name": "Hot Lead?",
-            "type": "n8n-nodes-base.if",
-            "typeVersion": 2,
-            "position": [
-                1600,
-                260
-            ]
-        },
-        {
-            "parameters": {
-                "method": "POST",
-                "url": "={{`https://api.telegram.org/bot${$env.TELEGRAM_BOT_TOKEN}/sendMessage`}}",
-                "sendBody": true,
-                "contentType": "json",
-                "specifyBody": "json",
-                "jsonBody": "={{ { chat_id: $env.TELEGRAM_CHAT_ID, text: `Hot lead from Graspia / SunPro Solar\\n\\nName: ${$json.name || \u0027-\u0027}\\nPhone: ${$json.phone || \u0027-\u0027}\\nEmail: ${$json.email || \u0027-\u0027}\\nPreferred contact: ${$json.preferredContact || \u0027-\u0027}\\nArea: ${$json.area || \u0027-\u0027}\\nBudget: ${$json.budget || \u0027-\u0027}\\nCustomer message: ${$json.message || \u0027-\u0027}\\nNotes: ${$json.notes || \u0027-\u0027}\\nTier: ${$json.automation?.tier || \u0027-\u0027}\\nReason: ${$json.automation?.reasoning || \u0027-\u0027}\\nValidation: ${$json.automation?.validationReason || \u0027none\u0027}\\nSummary: ${$json.handover?.summary || $json.message || \u0027-\u0027}` } }}"
-            },
-            "id": "cf15cd11-2753-4db4-8a66-ced45c700242",
-            "name": "Send Telegram Hot Lead Alert",
-            "type": "n8n-nodes-base.httpRequest",
-            "typeVersion": 4.2,
-            "position": [
-                1840,
-                160
-            ],
-            "continueOnFail": true
-        },
-        {
-            "parameters": {
-                "jsCode": "const original = $(\u0027AI Classify Lead\u0027).first().json;\nconst notificationFailed = Boolean($json.error || $json.message || $json.statusCode \u003e= 400 || $json.ok === false);\nreturn [{\n  json: {\n    ...original.automation,\n    notificationSent: !notificationFailed,\n    notificationChannel: notificationFailed ? \u0027telegram-failed\u0027 : \u0027telegram\u0027,\n    notificationError: notificationFailed ? ($json.description ?? $json.error?.message ?? $json.message ?? JSON.stringify($json)) : null\n  }\n}];"
-            },
-            "id": "11b410bc-1d21-481a-a345-76969fd25355",
-            "name": "Return Hot Auto Reply",
-            "type": "n8n-nodes-base.code",
-            "typeVersion": 2,
-            "position": [
-                2080,
-                160
-            ]
-        },
-        {
-            "parameters": {
-                "jsCode": "return [{ json: $json.automation }];"
-            },
-            "id": "b4da6fe2-2950-4ea3-bb0a-8d86502ff250",
-            "name": "Return Warm Cold Auto Reply",
-            "type": "n8n-nodes-base.code",
-            "typeVersion": 2,
-            "position": [
-                1840,
-                360
-            ]
+  "name": "Graspia Handover Automation",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "graspia-handover",
+        "responseMode": "lastNode",
+        "responseData": "firstEntryJson",
+        "options": {}
+      },
+      "id": "0f0f4d46-4bb5-47d4-ab5b-4243a309c6dd",
+      "name": "Receive Lead Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        160,
+        260
+      ],
+      "webhookId": "graspia-handover"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Retry helper for OpenAI validation calls so temporary rate limits or network issues do not immediately force fallback.\nconst sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));\nasync function fetchWithRetry(label, requestFactory, options = {}) {\n  const attempts = options.attempts ?? 2;\n  const delayMs = options.delayMs ?? 2000;\n  let lastResponse = null;\n  let lastError = null;\n\n  for (let attempt = 1; attempt <= attempts; attempt += 1) {\n    try {\n      const response = await requestFactory();\n      lastResponse = response;\n      const retryableStatus = response.status === 429 || response.status >= 500;\n      if (response.ok || !retryableStatus || attempt === attempts) {\n        return response;\n      }\n    } catch (error) {\n      lastError = error;\n      if (attempt === attempts) {\n        throw error;\n      }\n    }\n\n    await sleep(delayMs * attempt);\n  }\n\n  if (lastResponse) return lastResponse;\n  throw lastError ?? new Error(label + ' failed after retry.');\n}\n\nconst payload = $json.body ?? $json;\nconst normalize = (value) => String(value ?? '').trim();\nconst digitsOnly = (value) => normalize(value).replace(/\\D/g, '');\nconst allUserText = (payload.messages ?? [])\n  .filter((message) => message.role === 'user')\n  .map((message) => String(message.content ?? ''))\n  .join(' ');\nconst latestUserMessage = [...(payload.messages ?? [])].reverse().find((message) => message.role === 'user')?.content ?? '';\nconst extractedPhone = allUserText.match(/(?:\\+\\d{7,15}|(?:\\+?66|0)\\d[\\d\\s-]{7,})/)?.[0] ?? '';\nconst extractedEmail = allUserText.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/i)?.[0] ?? '';\nconst extractedName = allUserText.match(/(?:my name is|name is|i am|i'm)\\s+([A-Za-z][A-Za-z\\s'-]{1,40})/i)?.[1]?.trim() ?? '';\nconst preferredContact = normalize(payload.lead?.preferredContact) || (extractedPhone ? 'phone' : extractedEmail ? 'email' : '');\nconst notes = normalize(payload.lead?.notes);\nconst lead = {\n  name: normalize(payload.name ?? payload.lead?.name) || extractedName,\n  phone: normalize(payload.phone ?? payload.lead?.phone) || normalize(extractedPhone),\n  email: normalize(payload.email ?? payload.lead?.email) || normalize(extractedEmail),\n  message: normalize(payload.message || latestUserMessage || payload.handover?.summary),\n  budget: normalize(payload.budget),\n  area: normalize(payload.area),\n  preferredContact,\n  notes,\n};\nconst fallbackFlags = [];\nif (!lead.phone && !lead.email) fallbackFlags.push('missing_contact');\nif (lead.message.length < 8) fallbackFlags.push('message_too_short');\nif (/^(test|tester|admin|fake|unknown|n\\/a)$/i.test(lead.name)) fallbackFlags.push('fake_name');\nif (/^(test|fake|demo|sample)/i.test(lead.email)) fallbackFlags.push('fake_email');\nif (digitsOnly(lead.phone) && /^(0|1|9)\\1+$/.test(digitsOnly(lead.phone))) fallbackFlags.push('fake_phone');\nif (/free money|casino|crypto|seo service|loan|https?:\\/\\//i.test(Object.values(lead).join(' '))) fallbackFlags.push('spam_pattern');\nlet validation = {\n  valid: fallbackFlags.length === 0,\n  reason: fallbackFlags[0] ?? null,\n  flags: fallbackFlags\n};\nif ($env.OPENAI_API_KEY) {\n  try {\n    const response = await fetchWithRetry('OpenAI validation', () => fetch('https://api.openai.com/v1/chat/completions', {\n      method: 'POST',\n      headers: {\n        'Content-Type': 'application/json',\n        Authorization: 'Bearer ' + $env.OPENAI_API_KEY\n      },\n      body: JSON.stringify({\n        model: 'gpt-5.4-mini',\n        temperature: 0,\n        response_format: { type: 'json_object' },\n        messages: [\n          {\n            role: 'system',\n            content: 'You validate inbound sales leads. Return strict JSON only: {\"valid\":boolean,\"reason\":string|null,\"flags\":[string]}. Reject spam, empty leads, fake-looking names/contact details, nonsense, or entries without any usable contact method. Do not reject just because optional budget or area is missing.'\n          },\n          {\n            role: 'user',\n            content: JSON.stringify({ lead, handover: payload.handover ?? null })\n          }\n        ]\n      })\n    }), { attempts: 2, delayMs: 2000 });\n    if (response.ok) {\n      const data = await response.json();\n      const parsed = JSON.parse(data.choices?.[0]?.message?.content ?? '{}');\n      if (typeof parsed.valid === 'boolean') {\n        validation = {\n          valid: parsed.valid,\n          reason: parsed.reason ?? (parsed.valid ? null : 'ai_rejected'),\n          flags: Array.isArray(parsed.flags) ? parsed.flags.map(String) : fallbackFlags\n        };\n      }\n    }\n  } catch (error) {\n    validation.flags = [...new Set([...validation.flags, 'ai_validation_fallback'])];\n  }\n}\nreturn [{ json: { ...payload, ...lead, validation } }];"
+      },
+      "id": "64cedc73-2c2e-49fe-8f07-63f605cf925d",
+      "name": "AI Validate Lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Retry helper for lead storage so brief app/database outages do not immediately skip persistence.\nconst sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));\nasync function fetchWithRetry(label, requestFactory, options = {}) {\n  const attempts = options.attempts ?? 3;\n  const delayMs = options.delayMs ?? 2000;\n  let lastResponse = null;\n  let lastError = null;\n\n  for (let attempt = 1; attempt <= attempts; attempt += 1) {\n    try {\n      const response = await requestFactory();\n      lastResponse = response;\n      const retryableStatus = response.status === 429 || response.status >= 500;\n      if (response.ok || !retryableStatus || attempt === attempts) {\n        return response;\n      }\n    } catch (error) {\n      lastError = error;\n      if (attempt === attempts) {\n        throw error;\n      }\n    }\n\n    await sleep(delayMs * attempt);\n  }\n\n  if (lastResponse) return lastResponse;\n  throw lastError ?? new Error(label + ' failed after retry.');\n}\n\nconst baseUrl = $env.GRASPIA_APP_BASE_URL || 'http://host.docker.internal:3000';\nconst storage = { databaseSaved: false, databaseError: null };\nconst preliminaryAutomation = {\n  accepted: Boolean($json.validation?.valid),\n  rejected: !Boolean($json.validation?.valid),\n  tier: 'cold',\n  reasoning: $json.validation?.valid ? 'Lead received and stored before classification.' : 'Lead rejected during validation: ' + ($json.validation?.reason ?? 'unknown'),\n  autoReply: '',\n  notifyUrgent: false,\n  notificationSent: false,\n  notificationChannel: 'not-classified-yet',\n  validationReason: $json.validation?.reason ?? null\n};\ntry {\n  const response = await fetchWithRetry('Lead database save', () => fetch(baseUrl + '/api/automation/lead', {\n    method: 'POST',\n    headers: { 'Content-Type': 'application/json' },\n    body: JSON.stringify({\n      conversationId: $json.conversationId,\n      preferredLanguage: $json.preferredLanguage ?? 'en',\n      name: $json.name ?? '',\n      phone: $json.phone ?? '',\n      email: $json.email ?? '',\n      message: $json.message ?? '',\n      budget: $json.budget ?? '',\n      area: $json.area ?? '',\n      handover: $json.handover ?? null,\n      automation: preliminaryAutomation,\n      rawPayload: $json\n    })\n  }), { attempts: 3, delayMs: 2000 });\n  if (response.ok) {\n    const saved = await response.json();\n    storage.databaseSaved = true;\n    storage.leadRecordId = saved.leadRecordId ?? null;\n  } else {\n    storage.databaseError = response.status + ' ' + await response.text();\n  }\n} catch (error) {\n  storage.databaseError = error instanceof Error ? error.message : String(error);\n}\nreturn [{ json: { ...$json, storage } }];"
+      },
+      "id": "05ed144b-5f47-4139-ae6d-d2a3a8cc109e",
+      "name": "Save Lead to Database Best Effort",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Retry helper for OpenAI classification and acknowledgement calls; fallback heuristics still run after retries fail.\nconst sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));\nasync function fetchWithRetry(label, requestFactory, options = {}) {\n  const attempts = options.attempts ?? 2;\n  const delayMs = options.delayMs ?? 2000;\n  let lastResponse = null;\n  let lastError = null;\n\n  for (let attempt = 1; attempt <= attempts; attempt += 1) {\n    try {\n      const response = await requestFactory();\n      lastResponse = response;\n      const retryableStatus = response.status === 429 || response.status >= 500;\n      if (response.ok || !retryableStatus || attempt === attempts) {\n        return response;\n      }\n    } catch (error) {\n      lastError = error;\n      if (attempt === attempts) {\n        throw error;\n      }\n    }\n\n    await sleep(delayMs * attempt);\n  }\n\n  if (lastResponse) return lastResponse;\n  throw lastError ?? new Error(label + ' failed after retry.');\n}\n\nconst payload = $('AI Validate Lead').first().json;\nconst storage = $('Save Lead to Database Best Effort').first().json.storage ?? {};\nconst preferredLanguage = payload.preferredLanguage === 'th' ? 'th' : 'en';\nconst invalid = !payload.validation?.valid;\nlet classification = invalid\n  ? {\n      tier: 'cold',\n      reasoning: 'Lead rejected during validation: ' + (payload.validation?.reason ?? 'invalid'),\n      autoReply: ''\n    }\n  : null;\nif (!classification && $env.OPENAI_API_KEY) {\n  try {\n    const response = await fetchWithRetry('OpenAI lead classification', () => fetch('https://api.openai.com/v1/chat/completions', {\n      method: 'POST',\n      headers: {\n        'Content-Type': 'application/json',\n        Authorization: 'Bearer ' + $env.OPENAI_API_KEY\n      },\n      body: JSON.stringify({\n        model: 'gpt-5.4-mini',\n        temperature: 0.2,\n        response_format: { type: 'json_object' },\n        messages: [\n          {\n            role: 'system',\n            content: 'You classify validated inbound solar leads. Return strict JSON only: {\"tier\":\"hot|warm|cold\",\"reasoning\":\"...\"}. Base tier on message, budget, area, buying urgency, frustration, and handover reason. hot means immediate team notification is needed. warm/cold should not trigger urgent notification.'\n          },\n          {\n            role: 'user',\n            content: JSON.stringify({\n              preferredLanguage,\n              lead: {\n                name: payload.name,\n                phone: payload.phone,\n                email: payload.email,\n                message: payload.message,\n                budget: payload.budget,\n                area: payload.area\n              },\n              handover: payload.handover ?? null\n            })\n          }\n        ]\n      })\n    }), { attempts: 2, delayMs: 2000 });\n    if (response.ok) {\n      const data = await response.json();\n      const parsed = JSON.parse(data.choices?.[0]?.message?.content ?? '{}');\n      if (['hot', 'warm', 'cold'].includes(parsed.tier) && typeof parsed.reasoning === 'string') {\n        classification = {\n          tier: parsed.tier,\n          reasoning: parsed.reasoning,\n          autoReply: ''\n        };\n      }\n    }\n  } catch (error) {\n    // Fallback below keeps the workflow moving.\n  }\n}\nif (!classification) {\n  const text = (payload.message + ' ' + payload.budget + ' ' + (payload.handover?.summary ?? '')).toLowerCase();\n  const isHot = payload.handover?.reason === 'ready_to_buy' || payload.handover?.reason === 'angry_client' || /ready|buy|purchase|sign|pay|deposit|invoice/.test(text);\n  const isWarm = payload.handover?.reason === 'asked_for_human' || /\\d/.test(payload.budget ?? '') || /survey|quote|interested/.test(text);\n  classification = {\n    tier: isHot ? 'hot' : isWarm ? 'warm' : 'cold',\n    reasoning: isHot\n      ? 'Fallback scoring marked this lead as urgent based on close intent or frustration.'\n      : isWarm\n        ? 'Fallback scoring found interest or budget signal, but no immediate close intent.'\n        : 'Fallback scoring found limited buying signal and more qualification is needed.',\n    autoReply: ''\n  };\n}\nlet autoReply = classification.autoReply;\nif ($env.OPENAI_API_KEY) {\n  try {\n    const replyResponse = await fetchWithRetry('OpenAI acknowledgement reply', () => fetch('https://api.openai.com/v1/chat/completions', {\n      method: 'POST',\n      headers: {\n        'Content-Type': 'application/json',\n        Authorization: 'Bearer ' + $env.OPENAI_API_KEY\n      },\n      body: JSON.stringify({\n        model: 'gpt-5.4-mini',\n        temperature: 0.4,\n        response_format: { type: 'json_object' },\n        messages: [\n          {\n            role: 'system',\n            content: 'You write a short customer-facing acknowledgement for a solar lead. Return strict JSON only: {\"autoReply\":\"...\"}. Keep it warm, natural, and specific to the conversation. If the lead is incomplete, say the details are not enough yet but the team will reach out soon to ask for the missing information. If the lead is valid, acknowledge interest and mention next steps. Do not mention internal validation errors. Match the preferred language. Avoid sounding robotic or canned.'\n          },\n          {\n            role: 'user',\n            content: JSON.stringify({\n              preferredLanguage,\n              validation: payload.validation ?? null,\n              classification: {\n                tier: classification.tier,\n                reasoning: classification.reasoning\n              },\n              lead: {\n                name: payload.name,\n                phone: payload.phone,\n                email: payload.email,\n                message: payload.message,\n                budget: payload.budget,\n                area: payload.area\n              },\n              handover: payload.handover ?? null,\n              business: payload.business ?? null\n            })\n          }\n        ]\n      })\n    }), { attempts: 2, delayMs: 2000 });\n    if (replyResponse.ok) {\n      const replyData = await replyResponse.json();\n      const replyParsed = JSON.parse(replyData.choices?.[0]?.message?.content ?? '{}');\n      if (typeof replyParsed.autoReply === 'string' && replyParsed.autoReply.trim()) {\n        autoReply = replyParsed.autoReply.trim();\n      }\n    }\n  } catch (error) {\n    // Use the fallback auto reply below.\n  }\n}\nif (!autoReply) {\n  autoReply = invalid\n    ? 'Thanks for reaching out. We do not have enough details yet, but our team will contact you soon to ask for the missing information and help with the next step.'\n    : 'Thanks for the details. Our team will review everything and follow up soon with the next step.';\n}\nconst automation = {\n  accepted: Boolean(payload.validation?.valid),\n  rejected: !Boolean(payload.validation?.valid),\n  tier: classification.tier,\n  reasoning: classification.reasoning,\n  autoReply,\n  notifyUrgent: classification.tier === 'hot' && Boolean(payload.validation?.valid),\n  notificationSent: false,\n  notificationChannel: classification.tier === 'hot' && Boolean(payload.validation?.valid) ? 'telegram-pending' : 'saved-only',\n  validationReason: payload.validation?.reason ?? null,\n  leadRecordId: storage.leadRecordId ?? null,\n  storage: {\n    databaseSaved: Boolean(storage.databaseSaved),\n    databaseError: storage.databaseError ?? null\n  }\n};\nreturn [{ json: { ...payload, storage, automation } }];"
+      },
+      "id": "0f59ad1d-3af7-4611-8275-97aab0c08553",
+      "name": "AI Classify Lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.automation.notifyUrgent}}",
+              "value2": true
+            }
+          ]
         }
-    ],
-    "connections": {
-        "Receive Lead Webhook": {
-            "main": [
-                [
-                    {
-                        "node": "AI Validate Lead",
-                        "type": "main",
-                        "index": 0
-                    }
-                ]
-            ]
-        },
-        "AI Validate Lead": {
-            "main": [
-                [
-                    {
-                        "node": "Save Lead to Database Best Effort",
-                        "type": "main",
-                        "index": 0
-                    }
-                ]
-            ]
-        },
-        "Save Lead to Database Best Effort": {
-            "main": [
-                [
-                    {
-                        "node": "AI Classify Lead",
-                        "type": "main",
-                        "index": 0
-                    }
-                ]
-            ]
-        },
-        "AI Classify Lead": {
-            "main": [
-                [
-                    {
-                        "node": "Hot Lead?",
-                        "type": "main",
-                        "index": 0
-                    }
-                ]
-            ]
-        },
-        "Hot Lead?": {
-            "main": [
-                [
-                    {
-                        "node": "Send Telegram Hot Lead Alert",
-                        "type": "main",
-                        "index": 0
-                    }
-                ],
-                [
-                    {
-                        "node": "Return Warm Cold Auto Reply",
-                        "type": "main",
-                        "index": 0
-                    }
-                ]
-            ]
-        },
-        "Send Telegram Hot Lead Alert": {
-            "main": [
-                [
-                    {
-                        "node": "Return Hot Auto Reply",
-                        "type": "main",
-                        "index": 0
-                    }
-                ]
-            ]
-        }
+      },
+      "id": "b6d199c8-625c-4745-a4a7-2d5994543da8",
+      "name": "Hot Lead?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1600,
+        260
+      ]
     },
-    "pinData": {},
-    "active": false,
-    "settings": {
-        "executionOrder": "v1"
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{`https://api.telegram.org/bot${$env.TELEGRAM_BOT_TOKEN}/sendMessage`}}",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ { chat_id: $env.TELEGRAM_CHAT_ID, text: `Hot lead from Graspia / SunPro Solar\\n\\nName: ${$json.name || '-'}\\nPhone: ${$json.phone || '-'}\\nEmail: ${$json.email || '-'}\\nPreferred contact: ${$json.preferredContact || '-'}\\nArea: ${$json.area || '-'}\\nBudget: ${$json.budget || '-'}\\nCustomer message: ${$json.message || '-'}\\nNotes: ${$json.notes || '-'}\\nTier: ${$json.automation?.tier || '-'}\\nReason: ${$json.automation?.reasoning || '-'}\\nValidation: ${$json.automation?.validationReason || 'none'}\\nSummary: ${$json.handover?.summary || $json.message || '-'}` } }}"
+      },
+      "id": "cf15cd11-2753-4db4-8a66-ced45c700242",
+      "name": "Send Telegram Hot Lead Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1840,
+        160
+      ],
+      "continueOnFail": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
     },
-    "versionId": "0308ae14-718f-4b91-8c09-3c0f0f62a225",
-    "meta": {
-        "templateCredsSetupCompleted": false
+    {
+      "parameters": {
+        "jsCode": "const original = $('AI Classify Lead').first().json;\nconst notificationFailed = Boolean($json.error || $json.message || $json.statusCode >= 400 || $json.ok === false);\nreturn [{\n  json: {\n    ...original.automation,\n    notificationSent: !notificationFailed,\n    notificationChannel: notificationFailed ? 'telegram-failed' : 'telegram',\n    notificationError: notificationFailed ? ($json.description ?? $json.error?.message ?? $json.message ?? JSON.stringify($json)) : null\n  }\n}];"
+      },
+      "id": "11b410bc-1d21-481a-a345-76969fd25355",
+      "name": "Return Hot Auto Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2080,
+        160
+      ]
     },
-    "id": "GraspiaHandoverAutomation",
-    "tags": []
+    {
+      "parameters": {
+        "jsCode": "return [{ json: $json.automation }];"
+      },
+      "id": "b4da6fe2-2950-4ea3-bb0a-8d86502ff250",
+      "name": "Return Warm Cold Auto Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1840,
+        360
+      ]
+    }
+  ],
+  "connections": {
+    "Receive Lead Webhook": {
+      "main": [
+        [
+          {
+            "node": "AI Validate Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Validate Lead": {
+      "main": [
+        [
+          {
+            "node": "Save Lead to Database Best Effort",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Lead to Database Best Effort": {
+      "main": [
+        [
+          {
+            "node": "AI Classify Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Classify Lead": {
+      "main": [
+        [
+          {
+            "node": "Hot Lead?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hot Lead?": {
+      "main": [
+        [
+          {
+            "node": "Send Telegram Hot Lead Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return Warm Cold Auto Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Telegram Hot Lead Alert": {
+      "main": [
+        [
+          {
+            "node": "Return Hot Auto Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "0308ae14-718f-4b91-8c09-3c0f0f62a225",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "id": "GraspiaHandoverAutomation",
+  "tags": []
 }
