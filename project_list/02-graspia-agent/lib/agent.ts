@@ -17,7 +17,9 @@ const closePattern =
   /\b(sign|contract|pay|payment link|invoice|deposit)\b/i;
 const buyingIntentPattern =
   /\b(buy|purchase|ready to proceed|ready to move forward|book now|take it|i'll take it|i will take it|go ahead|move forward|proceed)\b/i;
-const jailbreakPattern =
+
+  // Flags common prompt-injection attempts so the agent can refuse instead of following attacker instructions.
+  const jailbreakPattern =
   /\b(ignore (all|your|previous) instructions|reveal (the )?system prompt|developer message|jailbreak|act as|pretend to be|you are now)\b/i;
 const unsupportedQuestionPattern =
   /\b(tax|depreciation|legal|lawyer|lawsuit|roi|return on investment|guarantee|guaranteed|exact savings)\b/i;
@@ -414,7 +416,8 @@ export async function runSalesAgent(
         : "Absolutely. To arrange the free site survey and hand this to our team properly, could you share your name, best contact method such as LINE, phone, or email, plus the property type and province/area?";
     finalDecision.confidence = Math.min(finalDecision.confidence, 0.84);
   }
-
+  
+    // Final safety override: if the user tries to jailbreak the agent, keep the bot in the approved solar-sales scope.
   if (jailbreakAttempt && !finalDecision.shouldHandover) {
     finalDecision.answer =
       "I can only help with SunPro Solar's solar installation service. If you'd like, I can recommend a package or help book a free site survey.";
